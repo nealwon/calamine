@@ -140,6 +140,7 @@ pub struct Dimensions {
     pub end: (u32, u32),
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl Dimensions {
     /// create dimensions info with start position and end position
     pub fn new(start: (u32, u32), end: (u32, u32)) -> Self {
@@ -214,6 +215,18 @@ pub struct Sheet {
     pub visible: SheetVisible,
 }
 
+/// Row to use as header
+/// By default, the first non-empty row is used as header
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub enum HeaderRow {
+    /// First non-empty row
+    #[default]
+    FirstNonEmptyRow,
+    /// Index of the header row
+    Row(u32),
+}
+
 // FIXME `Reader` must only be seek `Seek` for `Xls::xls`. Because of the present API this limits
 // the kinds of readers (other) data in formats can be read from.
 /// A trait to share spreadsheets reader functions across different `FileType`s
@@ -226,6 +239,10 @@ where
 
     /// Creates a new instance.
     fn new(reader: RS) -> Result<Self, Self::Error>;
+
+    /// Set header row (i.e. first row to be read)
+    /// If `header_row` is `None`, the first non-empty row will be used as header row
+    fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self;
 
     /// Gets `VbaProject`
     fn vba_project(&mut self) -> Option<Result<Cow<'_, VbaProject>, Self::Error>>;
@@ -280,6 +297,29 @@ where
     /// Get all pictures, tuple as (ext: String, data: Vec<u8>)
     #[cfg(feature = "picture")]
     fn pictures(&self) -> Option<Vec<(String, Vec<u8>)>>;
+}
+
+/// A trait to share spreadsheets reader functions across different `FileType`s
+pub trait ReaderRef<RS>: Reader<RS>
+where
+    RS: Read + Seek,
+{
+    /// Get worksheet range where shared string values are only borrowed.
+    ///
+    /// This is implemented only for [`calamine::Xlsb`] and [`calamine::Xlsx`], as Xls and Ods formats
+    /// do not support lazy iteration.
+    fn worksheet_range_ref<'a>(&'a mut self, name: &str)
+        -> Result<Range<DataRef<'a>>, Self::Error>;
+
+    /// Get the nth worksheet range where shared string values are only borrowed. Shortcut for getting the nth
+    /// sheet_name, then the corresponding worksheet.
+    ///
+    /// This is implemented only for [`calamine::Xlsb`] and [`calamine::Xlsx`], as Xls and Ods formats
+    /// do not support lazy iteration.
+    fn worksheet_range_at_ref(&mut self, n: usize) -> Option<Result<Range<DataRef>, Self::Error>> {
+        let name = self.sheet_names().get(n)?.to_string();
+        Some(self.worksheet_range_ref(&name))
+    }
 }
 
 /// Convenient function to open a file with a BufReader<File>
@@ -444,7 +484,7 @@ impl<T: CellType> Range<T> {
             // search bounds
             let row_start = cells.first().unwrap().pos.0;
             let row_end = cells.last().unwrap().pos.0;
-            let mut col_start = std::u32::MAX;
+            let mut col_start = u32::MAX;
             let mut col_end = 0;
             for c in cells.iter().map(|c| c.pos.1) {
                 if c < col_start {
@@ -463,7 +503,9 @@ impl<T: CellType> Range<T> {
                 let row = (c.pos.0 - row_start) as usize;
                 let col = (c.pos.1 - col_start) as usize;
                 let idx = row.saturating_mul(cols) + col;
-                v.get_mut(idx).map(|v| *v = c.val);
+                if let Some(v) = v.get_mut(idx) {
+                    *v = c.val;
+                }
             }
             Range {
                 start: (row_start, col_start),
@@ -928,6 +970,12 @@ impl<T> Table<T> {
     /// Get a range representing the data from the table (excludes column headers)
     pub fn data(&self) -> &Range<T> {
         &self.data
+    }
+}
+
+impl<T: CellType> From<Table<T>> for Range<T> {
+    fn from(table: Table<T>) -> Range<T> {
+        table.data
     }
 }
 

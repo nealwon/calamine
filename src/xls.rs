@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::BTreeMap;
-use std::convert::TryInto;
 use std::fmt::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
@@ -18,7 +17,8 @@ use crate::utils::read_usize;
 use crate::utils::{push_column, read_f64, read_i16, read_i32, read_u16, read_u32};
 use crate::vba::VbaProject;
 use crate::{
-    Cell, CellErrorType, Data, Dimensions, Metadata, Range, Reader, Sheet, SheetType, SheetVisible,
+    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, Sheet, SheetType,
+    SheetVisible,
 };
 
 #[derive(Debug)]
@@ -72,6 +72,11 @@ pub enum XlsError {
     Art(&'static str),
     /// Worksheet not found
     WorksheetNotFound(String),
+    /// Invalid iFmt value
+    InvalidFormat {
+        /// iFmt value, See 2.4.126 Format
+        ifmt: u16,
+    },
 }
 
 from_err!(std::io::Error, XlsError, Io);
@@ -109,6 +114,7 @@ impl std::fmt::Display for XlsError {
             #[cfg(feature = "picture")]
             XlsError::Art(s) => write!(f, "Invalid art record '{s}'"),
             XlsError::WorksheetNotFound(name) => write!(f, "Worksheet '{name}' not found"),
+            XlsError::InvalidFormat { ifmt } => write!(f, "Invalid ifmt value: '{ifmt}'"),
         }
     }
 }
@@ -137,6 +143,8 @@ pub struct XlsOptions {
     ///
     /// [code page]: https://docs.microsoft.com/en-us/windows/win32/intl/code-page-identifiers
     pub force_codepage: Option<u16>,
+    /// Row to use as header
+    pub header_row: HeaderRow,
 }
 
 struct SheetData {
@@ -232,6 +240,11 @@ impl<RS: Read + Seek> Reader<RS> for Xls<RS> {
         Self::new_with_options(reader, XlsOptions::default())
     }
 
+    fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self {
+        self.options.header_row = header_row;
+        self
+    }
+
     fn vba_project(&mut self) -> Option<Result<Cow<'_, VbaProject>, XlsError>> {
         self.vba.as_ref().map(|vba| Ok(Cow::Borrowed(vba)))
     }
@@ -242,10 +255,23 @@ impl<RS: Read + Seek> Reader<RS> for Xls<RS> {
     }
 
     fn worksheet_range(&mut self, name: &str) -> Result<Range<Data>, XlsError> {
-        self.sheets
+        let sheet = self
+            .sheets
             .get(name)
             .map(|r| r.range.clone())
-            .ok_or_else(|| XlsError::WorksheetNotFound(name.into()))
+            .ok_or_else(|| XlsError::WorksheetNotFound(name.into()))?;
+
+        match self.options.header_row {
+            HeaderRow::FirstNonEmptyRow => Ok(sheet),
+            HeaderRow::Row(header_row_idx) => {
+                // If `header_row` is a row index, adjust the range
+                if let (Some(start), Some(end)) = (sheet.start(), sheet.end()) {
+                    Ok(sheet.range((header_row_idx, start.1), end))
+                } else {
+                    Ok(sheet)
+                }
+            }
+        }
     }
 
     fn worksheets(&mut self) -> Vec<(String, Range<Data>)> {
@@ -318,11 +344,13 @@ impl<RS: Read + Seek> Xls<RS> {
                             self.is_1904 = true
                         }
                     }
-                    // FORMATTING
-                    0x041E => {
-                        let (idx, format) = parse_format(&mut r, &encoding)?;
-                        formats.insert(idx, format);
-                    }
+                    // 2.4.126 FORMATTING
+                    0x041E => match parse_format(&mut r, &encoding, biff) {
+                        Ok((idx, format)) => {
+                            formats.insert(idx, format);
+                        }
+                        Err(e) => log::warn!("{e}"),
+                    },
                     // XFS
                     0x00E0 => {
                         xfs.push(parse_xf(&r)?);
@@ -575,14 +603,8 @@ fn parse_sheet_metadata(
         }
     };
     r.data = &r.data[6..];
-    let name = parse_short_string(r, encoding, biff)?;
-    let sheet_name = name
-        .as_bytes()
-        .iter()
-        .cloned()
-        .filter(|b| *b != 0)
-        .collect::<Vec<_>>();
-    let name = String::from_utf8(sheet_name).unwrap();
+    let mut name = parse_short_string(r, encoding, biff)?;
+    name.retain(|c| c != '\0');
     Ok((pos, Sheet { name, visible, typ }))
 }
 
@@ -663,7 +685,7 @@ fn parse_merge_cells(r: &[u8], merge_cells: &mut Vec<Dimensions>) -> Result<(), 
     for i in 0..count {
         let offset: usize = (2 + i * 8).into();
 
-        let rf = read_u16(&r[offset + 0..]);
+        let rf = read_u16(&r[offset..]);
         let rl = read_u16(&r[offset + 2..]);
         let cf = read_u16(&r[offset + 4..]);
         let cl = read_u16(&r[offset + 6..]);
@@ -896,24 +918,27 @@ fn parse_xf(r: &Record<'_>) -> Result<u16, XlsError> {
 /// Decode Format
 ///
 /// See: https://learn.microsoft.com/ru-ru/openspecs/office_file_formats/ms-xls/300280fd-e4fe-4675-a924-4d383af48d3b
-fn parse_format(r: &mut Record<'_>, encoding: &XlsEncoding) -> Result<(u16, CellFormat), XlsError> {
-    if r.data.len() < 4 {
+/// 2.4.126
+fn parse_format(
+    r: &mut Record<'_>,
+    encoding: &XlsEncoding,
+    biff: Biff,
+) -> Result<(u16, CellFormat), XlsError> {
+    if r.data.len() < 2 {
         return Err(XlsError::Len {
             typ: "format",
-            expected: 4,
+            expected: 2,
             found: r.data.len(),
         });
     }
+    let ifmt = read_u16(r.data);
+    match ifmt {
+        5..=8 | 23..=26 | 41..=44 | 63..=66 | 164..=382 => (),
+        _ => return Err(XlsError::InvalidFormat { ifmt }),
+    }
 
-    let idx = read_u16(r.data);
-
-    let cch = read_u16(&r.data[2..]) as usize;
-    let high_byte = r.data[4] & 0x1 != 0;
-    r.data = &r.data[5..];
-    let mut s = String::with_capacity(cch);
-    encoding.decode_to(r.data, cch, &mut s, Some(high_byte));
-
-    Ok((idx, detect_custom_number_format(&s)))
+    let s = parse_string(&r.data[2..], encoding, biff)?;
+    Ok((ifmt, detect_custom_number_format(&s)))
 }
 
 /// Decode XLUnicodeRichExtendedString.

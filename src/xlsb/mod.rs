@@ -5,7 +5,6 @@ pub use cells_reader::XlsbCellsReader;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek};
-use std::string::String;
 
 use log::debug;
 
@@ -21,7 +20,9 @@ use crate::datatype::DataRef;
 use crate::formats::{builtin_format_by_code, detect_custom_number_format, CellFormat};
 use crate::utils::{push_column, read_f64, read_i32, read_u16, read_u32, read_usize};
 use crate::vba::VbaProject;
-use crate::{Cell, Data, Metadata, Range, Reader, Sheet, SheetType, SheetVisible};
+use crate::{
+    Cell, Data, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet, SheetType, SheetVisible,
+};
 
 /// A Xlsb specific error
 #[derive(Debug)]
@@ -79,11 +80,14 @@ pub enum XlsbError {
     Password,
     /// Worksheet not found
     WorksheetNotFound(String),
+    /// XML Encoding error
+    Encoding(quick_xml::encoding::EncodingError),
 }
 
 from_err!(std::io::Error, XlsbError, Io);
 from_err!(zip::result::ZipError, XlsbError, Zip);
 from_err!(quick_xml::Error, XlsbError, Xml);
+from_err!(quick_xml::encoding::EncodingError, XlsbError, Encoding);
 
 impl std::fmt::Display for XlsbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,6 +117,7 @@ impl std::fmt::Display for XlsbError {
             }
             XlsbError::Password => write!(f, "Workbook is password protected"),
             XlsbError::WorksheetNotFound(name) => write!(f, "Worksheet '{name}' not found"),
+            XlsbError::Encoding(e) => write!(f, "XML encoding error: {e}"),
         }
     }
 }
@@ -129,6 +134,13 @@ impl std::error::Error for XlsbError {
     }
 }
 
+/// Xlsb reader options
+#[derive(Debug, Default)]
+#[non_exhaustive]
+struct XlsbOptions {
+    pub header_row: HeaderRow,
+}
+
 /// A Xlsb reader
 pub struct Xlsb<RS> {
     zip: ZipArchive<RS>,
@@ -141,6 +153,7 @@ pub struct Xlsb<RS> {
     metadata: Metadata,
     #[cfg(feature = "picture")]
     pictures: Option<Vec<(String, Vec<u8>)>>,
+    options: XlsbOptions,
 }
 
 impl<RS: Read + Seek> Xlsb<RS> {
@@ -150,10 +163,11 @@ impl<RS: Read + Seek> Xlsb<RS> {
         match self.zip.by_name("xl/_rels/workbook.bin.rels") {
             Ok(f) => {
                 let mut xml = XmlReader::from_reader(BufReader::new(f));
-                xml.check_end_names(false)
-                    .trim_text(false)
-                    .check_comments(false)
-                    .expand_empty_elements(true);
+                let config = xml.config_mut();
+                config.check_end_names = false;
+                config.trim_text(false);
+                config.check_comments = false;
+                config.expand_empty_elements = true;
                 let mut buf: Vec<u8> = Vec::with_capacity(64);
 
                 loop {
@@ -173,7 +187,12 @@ impl<RS: Read + Seek> Xlsb<RS> {
                                         key: QName(b"Target"),
                                         value: v,
                                     } => {
-                                        target = Some(xml.decoder().decode(&v)?.into_owned());
+                                        target = Some(
+                                            xml.decoder()
+                                                .decode(&v)
+                                                .map_err(XlsbError::Encoding)?
+                                                .into_owned(),
+                                        );
                                     }
                                     _ => (),
                                 }
@@ -389,7 +408,7 @@ impl<RS: Read + Seek> Xlsb<RS> {
     pub fn worksheet_cells_reader<'a>(
         &'a mut self,
         name: &str,
-    ) -> Result<XlsbCellsReader<'a>, XlsbError> {
+    ) -> Result<XlsbCellsReader<'a, RS>, XlsbError> {
         let path = match self.sheets.iter().find(|&(n, _)| n == name) {
             Some((_, path)) => path.clone(),
             None => return Err(XlsbError::WorksheetNotFound(name.into())),
@@ -410,19 +429,19 @@ impl<RS: Read + Seek> Xlsb<RS> {
         let mut pics = Vec::new();
         for i in 0..self.zip.len() {
             let mut zfile = self.zip.by_index(i)?;
-            let zname = zfile.name().to_owned();
+            let zname = zfile.name();
             if zname.starts_with("xl/media") {
-                let name_ext: Vec<&str> = zname.split(".").collect();
-                if let Some(ext) = name_ext.last() {
+                if let Some(ext) = zname.split('.').last() {
                     if [
                         "emf", "wmf", "pict", "jpeg", "jpg", "png", "dib", "gif", "tiff", "eps",
                         "bmp", "wpg",
                     ]
-                    .contains(ext)
+                    .contains(&ext)
                     {
+                        let ext = ext.to_string();
                         let mut buf: Vec<u8> = Vec::new();
                         zfile.read_to_end(&mut buf)?;
-                        pics.push((ext.to_string(), buf));
+                        pics.push((ext, buf));
                     }
                 }
             }
@@ -450,6 +469,7 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
             metadata: Metadata::default(),
             #[cfg(feature = "picture")]
             pictures: None,
+            options: XlsbOptions::default(),
         };
         xlsb.read_shared_strings()?;
         xlsb.read_styles()?;
@@ -459,6 +479,11 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
         xlsb.read_pictures()?;
 
         Ok(xlsb)
+    }
+
+    fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self {
+        self.options.header_row = header_row;
+        self
     }
 
     fn vba_project(&mut self) -> Option<Result<Cow<'_, VbaProject>, XlsbError>> {
@@ -476,14 +501,13 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
 
     /// MS-XLSB 2.1.7.62
     fn worksheet_range(&mut self, name: &str) -> Result<Range<Data>, XlsbError> {
-        let mut cells_reader = self.worksheet_cells_reader(name)?;
-        let mut cells = Vec::with_capacity(cells_reader.dimensions().len().min(1_000_000) as _);
-        while let Some(cell) = cells_reader.next_cell()? {
-            if cell.val != DataRef::Empty {
-                cells.push(Cell::new(cell.pos, Data::from(cell.val)));
-            }
-        }
-        Ok(Range::from_sparse(cells))
+        let rge = self.worksheet_range_ref(name)?;
+        let inner = rge.inner.into_iter().map(|v| v.into()).collect();
+        Ok(Range {
+            start: rge.start,
+            end: rge.end,
+            inner,
+        })
     }
 
     /// MS-XLSB 2.1.7.62
@@ -520,16 +544,83 @@ impl<RS: Read + Seek> Reader<RS> for Xlsb<RS> {
     }
 }
 
-pub(crate) struct RecordIter<'a> {
-    b: [u8; 1],
-    r: BufReader<ZipFile<'a>>,
+impl<RS: Read + Seek> ReaderRef<RS> for Xlsb<RS> {
+    fn worksheet_range_ref<'a>(&'a mut self, name: &str) -> Result<Range<DataRef<'a>>, XlsbError> {
+        let header_row = self.options.header_row;
+        let mut cell_reader = self.worksheet_cells_reader(name)?;
+        let len = cell_reader.dimensions().len();
+        let mut cells = Vec::new();
+        if len < 100_000 {
+            cells.reserve(len as usize);
+        }
+
+        match header_row {
+            HeaderRow::FirstNonEmptyRow => {
+                // the header row is the row of the first non-empty cell
+                loop {
+                    match cell_reader.next_cell() {
+                        Ok(Some(Cell {
+                            val: DataRef::Empty,
+                            ..
+                        })) => (),
+                        Ok(Some(cell)) => cells.push(cell),
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            HeaderRow::Row(header_row_idx) => {
+                // If `header_row` is a row index, we only add non-empty cells after this index.
+                loop {
+                    match cell_reader.next_cell() {
+                        Ok(Some(Cell {
+                            val: DataRef::Empty,
+                            ..
+                        })) => (),
+                        Ok(Some(cell)) => {
+                            if cell.pos.0 >= header_row_idx {
+                                cells.push(cell);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // If `header_row` is set and the first non-empty cell is not at the `header_row`, we add
+                // an empty cell at the beginning with row `header_row` and same column as the first non-empty cell.
+                if cells.first().map_or(false, |c| c.pos.0 != header_row_idx) {
+                    cells.insert(
+                        0,
+                        Cell {
+                            pos: (
+                                header_row_idx,
+                                cells.first().expect("cells should not be empty").pos.1,
+                            ),
+                            val: DataRef::Empty,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(Range::from_sparse(cells))
+    }
 }
 
-impl<'a> RecordIter<'a> {
-    fn from_zip<RS: Read + Seek>(
-        zip: &'a mut ZipArchive<RS>,
-        path: &str,
-    ) -> Result<RecordIter<'a>, XlsbError> {
+pub(crate) struct RecordIter<'a, RS>
+where
+    RS: Read + Seek,
+{
+    b: [u8; 1],
+    r: BufReader<ZipFile<'a, RS>>,
+}
+
+impl<'a, RS> RecordIter<'a, RS>
+where
+    RS: Read + Seek,
+{
+    fn from_zip(zip: &'a mut ZipArchive<RS>, path: &str) -> Result<RecordIter<'a, RS>, XlsbError> {
         match zip.by_name(path) {
             Ok(f) => Ok(RecordIter {
                 r: BufReader::new(f),

@@ -18,12 +18,12 @@ use crate::datatype::DataRef;
 use crate::formats::{builtin_format_by_id, detect_custom_number_format, CellFormat};
 use crate::vba::VbaProject;
 use crate::{
-    Cell, CellErrorType, Data, Dimensions, Metadata, Range, Reader, Sheet, SheetType, SheetVisible,
-    Table,
+    Cell, CellErrorType, Data, Dimensions, HeaderRow, Metadata, Range, Reader, ReaderRef, Sheet,
+    SheetType, SheetVisible, Table,
 };
 pub use cells_reader::XlsxCellReader;
 
-pub(crate) type XlReader<'a> = XmlReader<BufReader<ZipFile<'a>>>;
+pub(crate) type XlReader<'a, RS> = XmlReader<BufReader<ZipFile<'a, RS>>>;
 
 /// Maximum number of rows allowed in an xlsx file
 pub const MAX_ROWS: u32 = 1_048_576;
@@ -87,6 +87,12 @@ pub enum XlsxError {
     WorksheetNotFound(String),
     /// Table not found
     TableNotFound(String),
+    /// The specified sheet is not a worksheet
+    NotAWorksheet(String),
+    /// XML Encoding error
+    Encoding(quick_xml::encoding::EncodingError),
+    /// XML attribute error
+    XmlAttribute(quick_xml::events::attributes::AttrError),
 }
 
 from_err!(std::io::Error, XlsxError, Io);
@@ -96,6 +102,12 @@ from_err!(quick_xml::Error, XlsxError, Xml);
 from_err!(std::string::ParseError, XlsxError, Parse);
 from_err!(std::num::ParseFloatError, XlsxError, ParseFloat);
 from_err!(std::num::ParseIntError, XlsxError, ParseInt);
+from_err!(quick_xml::encoding::EncodingError, XlsxError, Encoding);
+from_err!(
+    quick_xml::events::attributes::AttrError,
+    XlsxError,
+    XmlAttribute
+);
 
 impl std::fmt::Display for XlsxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -136,6 +148,9 @@ impl std::fmt::Display for XlsxError {
             XlsxError::WorksheetNotFound(n) => write!(f, "Worksheet '{n}' not found"),
             XlsxError::Password => write!(f, "Workbook is password protected"),
             XlsxError::TableNotFound(n) => write!(f, "Table '{n}' not found"),
+            XlsxError::NotAWorksheet(typ) => write!(f, "Expecting a worksheet, got {typ}"),
+            XlsxError::Encoding(e) => write!(f, "XML encoding error: {e}"),
+            XlsxError::XmlAttribute(e) => write!(f, "XML attribute error: {e}"),
         }
     }
 }
@@ -150,6 +165,8 @@ impl std::error::Error for XlsxError {
             XlsxError::Parse(e) => Some(e),
             XlsxError::ParseInt(e) => Some(e),
             XlsxError::ParseFloat(e) => Some(e),
+            XlsxError::Encoding(e) => Some(e),
+            XlsxError::XmlAttribute(e) => Some(e),
             _ => None,
         }
     }
@@ -194,6 +211,15 @@ pub struct Xlsx<RS> {
     pictures: Option<Vec<(String, Vec<u8>)>>,
     /// Merged Regions: Name, Sheet, Merged Dimensions
     merged_regions: Option<Vec<(String, String, Dimensions)>>,
+    /// Reader options
+    options: XlsxOptions,
+}
+
+/// Xlsx reader options
+#[derive(Debug, Default)]
+#[non_exhaustive]
+struct XlsxOptions {
+    pub header_row: HeaderRow,
 }
 
 impl<RS: Read + Seek> Xlsx<RS> {
@@ -318,13 +344,14 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                 key: QName(b"name"),
                                 ..
                             } => {
-                                name = a.decode_and_unescape_value(&xml)?.to_string();
+                                name = a.decode_and_unescape_value(xml.decoder())?.to_string();
                             }
                             Attribute {
                                 key: QName(b"state"),
                                 ..
                             } => {
-                                visible = match a.decode_and_unescape_value(&xml)?.as_ref() {
+                                visible = match a.decode_and_unescape_value(xml.decoder())?.as_ref()
+                                {
                                     "visible" => SheetVisible::Visible,
                                     "hidden" => SheetVisible::Hidden,
                                     "veryHidden" => SheetVisible::VeryHidden,
@@ -381,7 +408,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                 Ok(Event::Start(ref e)) if e.name().as_ref() == b"workbookPr" => {
                     self.is_1904 = match e.try_get_attribute("date1904")? {
                         Some(c) => ["1", "true"].contains(
-                            &c.decode_and_unescape_value(&xml)
+                            &c.decode_and_unescape_value(xml.decoder())
                                 .map_err(XlsxError::Xml)?
                                 .as_ref(),
                         ),
@@ -394,7 +421,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                         .filter_map(std::result::Result::ok)
                         .find(|a| a.key == QName(b"name"))
                     {
-                        let name = a.decode_and_unescape_value(&xml)?.to_string();
+                        let name = a.decode_and_unescape_value(xml.decoder())?.to_string();
                         val_buf.clear();
                         let mut value = String::new();
                         loop {
@@ -504,11 +531,8 @@ impl<RS: Read + Seek> Xlsx<RS> {
                                     // this is an incomplete implementation, but should be good enough for excel
                                     let new_index =
                                         base_folder.rfind('/').expect("Must be a parent folder");
-                                    let full_path = format!(
-                                        "{}{}",
-                                        base_folder[..new_index].to_owned(),
-                                        target[2..].to_owned()
-                                    );
+                                    let full_path =
+                                        format!("{}{}", &base_folder[..new_index], &target[2..]);
                                     table_locations.push(full_path);
                                 } else if target.is_empty() { // do nothing
                                 } else {
@@ -619,19 +643,19 @@ impl<RS: Read + Seek> Xlsx<RS> {
         let mut pics = Vec::new();
         for i in 0..self.zip.len() {
             let mut zfile = self.zip.by_index(i)?;
-            let zname = zfile.name().to_owned();
+            let zname = zfile.name();
             if zname.starts_with("xl/media") {
-                let name_ext: Vec<&str> = zname.split(".").collect();
-                if let Some(ext) = name_ext.last() {
+                if let Some(ext) = zname.split('.').last() {
                     if [
                         "emf", "wmf", "pict", "jpeg", "jpg", "png", "dib", "gif", "tiff", "eps",
                         "bmp", "wpg",
                     ]
-                    .contains(ext)
+                    .contains(&ext)
                     {
+                        let ext = ext.to_string();
                         let mut buf: Vec<u8> = Vec::new();
                         zfile.read_to_end(&mut buf)?;
-                        pics.push((ext.to_string(), buf));
+                        pics.push((ext, buf));
                     }
                 }
             }
@@ -648,7 +672,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
         for (sheet_name, sheet_path) in &self.sheets {
             // we need another mutable borrow of self.zip later so we enclose this borrow within braces
             {
-                let mut xml = match xml_reader(&mut self.zip, &sheet_path) {
+                let mut xml = match xml_reader(&mut self.zip, sheet_path) {
                     None => continue,
                     Some(x) => x?,
                 };
@@ -657,8 +681,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
                     buf.clear();
                     match xml.read_event_into(&mut buf) {
                         Ok(Event::Start(ref e)) if e.local_name() == QName(b"mergeCell").into() => {
-                            if let Some(attr) = get_attribute(e.attributes(), QName(b"ref").into())?
-                            {
+                            if let Some(attr) = get_attribute(e.attributes(), QName(b"ref"))? {
                                 let dismension = get_dimension(attr)?;
                                 regions.push((
                                     sheet_name.to_string(),
@@ -676,6 +699,32 @@ impl<RS: Read + Seek> Xlsx<RS> {
         }
         self.merged_regions = Some(regions);
         Ok(())
+    }
+
+    #[inline]
+    fn get_table_meta(&self, table_name: &str) -> Result<TableMetadata, XlsxError> {
+        let match_table_meta = self
+            .tables
+            .as_ref()
+            .expect("Tables must be loaded before they are referenced")
+            .iter()
+            .find(|(table, ..)| table == table_name)
+            .ok_or_else(|| XlsxError::TableNotFound(table_name.into()))?;
+
+        let name = match_table_meta.0.to_owned();
+        let sheet_name = match_table_meta.1.clone();
+        let columns = match_table_meta.2.clone();
+        let dimensions = Dimensions {
+            start: match_table_meta.3.start,
+            end: match_table_meta.3.end,
+        };
+
+        Ok(TableMetadata {
+            name,
+            sheet_name,
+            columns,
+            dimensions,
+        })
     }
 
     /// Load the merged regions
@@ -698,7 +747,7 @@ impl<RS: Read + Seek> Xlsx<RS> {
     pub fn merged_regions_by_sheet(&self, name: &str) -> Vec<(&String, &String, &Dimensions)> {
         self.merged_regions()
             .iter()
-            .filter(|s| (**s).0 == name)
+            .filter(|s| s.0 == name)
             .map(|(name, sheet, region)| (name, sheet, region))
             .collect()
     }
@@ -733,23 +782,39 @@ impl<RS: Read + Seek> Xlsx<RS> {
             .collect()
     }
 
-    /// Get the table by name
+    /// Get the table by name (owned)
     // TODO: If retrieving multiple tables from a single sheet, get tables by sheet will be more efficient
     pub fn table_by_name(&mut self, table_name: &str) -> Result<Table<Data>, XlsxError> {
-        let match_table_meta = self
-            .tables
-            .as_ref()
-            .expect("Tables must be loaded before they are referenced")
-            .iter()
-            .find(|(table, ..)| table == table_name)
-            .ok_or_else(|| XlsxError::TableNotFound(table_name.into()))?;
-        let name = match_table_meta.0.to_owned();
-        let sheet_name = match_table_meta.1.clone();
-        let columns = match_table_meta.2.clone();
-        let start_dim = match_table_meta.3.start;
-        let end_dim = match_table_meta.3.end;
+        let TableMetadata {
+            name,
+            sheet_name,
+            columns,
+            dimensions,
+        } = self.get_table_meta(table_name)?;
+        let Dimensions { start, end } = dimensions;
         let range = self.worksheet_range(&sheet_name)?;
-        let tbl_rng = range.range(start_dim, end_dim);
+        let tbl_rng = range.range(start, end);
+
+        Ok(Table {
+            name,
+            sheet_name,
+            columns,
+            data: tbl_rng,
+        })
+    }
+
+    /// Get the table by name (ref)
+    pub fn table_by_name_ref(&mut self, table_name: &str) -> Result<Table<DataRef>, XlsxError> {
+        let TableMetadata {
+            name,
+            sheet_name,
+            columns,
+            dimensions,
+        } = self.get_table_meta(table_name)?;
+        let Dimensions { start, end } = dimensions;
+        let range = self.worksheet_range_ref(&sheet_name)?;
+        let tbl_rng = range.range(start, end);
+
         Ok(Table {
             name,
             sheet_name,
@@ -808,6 +873,13 @@ impl<RS: Read + Seek> Xlsx<RS> {
     }
 }
 
+struct TableMetadata {
+    name: String,
+    sheet_name: String,
+    columns: Vec<String>,
+    dimensions: Dimensions,
+}
+
 struct InnerTableMetadata {
     display_name: String,
     ref_cells: String,
@@ -833,11 +905,11 @@ impl<RS: Read + Seek> Xlsx<RS> {
     pub fn worksheet_cells_reader<'a>(
         &'a mut self,
         name: &str,
-    ) -> Result<XlsxCellReader<'a>, XlsxError> {
+    ) -> Result<XlsxCellReader<'a, RS>, XlsxError> {
         let (_, path) = self
             .sheets
             .iter()
-            .find(|&&(ref n, _)| n == name)
+            .find(|&(n, _)| n == name)
             .ok_or_else(|| XlsxError::WorksheetNotFound(name.into()))?;
         let xml = xml_reader(&mut self.zip, path)
             .ok_or_else(|| XlsxError::WorksheetNotFound(name.into()))??;
@@ -845,34 +917,6 @@ impl<RS: Read + Seek> Xlsx<RS> {
         let strings = &self.strings;
         let formats = &self.formats;
         XlsxCellReader::new(xml, strings, formats, is_1904)
-    }
-
-    /// Get worksheet range where shared string values are only borrowed.
-    ///
-    /// This is implemented only for [`calamine::Xlsx`], as Xls and Ods formats
-    /// do not support lazy iteration.
-    pub fn worksheet_range_ref<'a>(
-        &'a mut self,
-        name: &str,
-    ) -> Result<Range<DataRef<'a>>, XlsxError> {
-        let mut cell_reader = self.worksheet_cells_reader(name)?;
-        let len = cell_reader.dimensions().len();
-        let mut cells = Vec::new();
-        if len < 100_000 {
-            cells.reserve(len as usize);
-        }
-        loop {
-            match cell_reader.next_cell() {
-                Ok(Some(Cell {
-                    val: DataRef::Empty,
-                    ..
-                })) => (),
-                Ok(Some(cell)) => cells.push(cell),
-                Ok(None) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(Range::from_sparse(cells))
     }
 }
 
@@ -893,6 +937,7 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
             #[cfg(feature = "picture")]
             pictures: None,
             merged_regions: None,
+            options: XlsxOptions::default(),
         };
         xlsx.read_shared_strings()?;
         xlsx.read_styles()?;
@@ -902,6 +947,11 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
         xlsx.read_pictures()?;
 
         Ok(xlsx)
+    }
+
+    fn with_header_row(&mut self, header_row: HeaderRow) -> &mut Self {
+        self.options.header_row = header_row;
+        self
     }
 
     fn vba_project(&mut self) -> Option<Result<Cow<'_, VbaProject>, XlsxError>> {
@@ -929,7 +979,14 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
     }
 
     fn worksheet_formula(&mut self, name: &str) -> Result<Range<String>, XlsxError> {
-        let mut cell_reader = self.worksheet_cells_reader(name)?;
+        let mut cell_reader = match self.worksheet_cells_reader(name) {
+            Ok(reader) => reader,
+            Err(XlsxError::NotAWorksheet(typ)) => {
+                warn!("'{typ}' not a worksheet");
+                return Ok(Range::default());
+            }
+            Err(e) => return Err(e),
+        };
         let len = cell_reader.dimensions().len();
         let mut cells = Vec::new();
         if len < 100_000 {
@@ -964,10 +1021,81 @@ impl<RS: Read + Seek> Reader<RS> for Xlsx<RS> {
     }
 }
 
+impl<RS: Read + Seek> ReaderRef<RS> for Xlsx<RS> {
+    fn worksheet_range_ref<'a>(&'a mut self, name: &str) -> Result<Range<DataRef<'a>>, XlsxError> {
+        let header_row = self.options.header_row;
+        let mut cell_reader = match self.worksheet_cells_reader(name) {
+            Ok(reader) => reader,
+            Err(XlsxError::NotAWorksheet(typ)) => {
+                log::warn!("'{typ}' not a valid worksheet");
+                return Ok(Range::default());
+            }
+            Err(e) => return Err(e),
+        };
+        let len = cell_reader.dimensions().len();
+        let mut cells = Vec::new();
+        if len < 100_000 {
+            cells.reserve(len as usize);
+        }
+
+        match header_row {
+            HeaderRow::FirstNonEmptyRow => {
+                // the header row is the row of the first non-empty cell
+                loop {
+                    match cell_reader.next_cell() {
+                        Ok(Some(Cell {
+                            val: DataRef::Empty,
+                            ..
+                        })) => (),
+                        Ok(Some(cell)) => cells.push(cell),
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            HeaderRow::Row(header_row_idx) => {
+                // If `header_row` is a row index, we only add non-empty cells after this index.
+                loop {
+                    match cell_reader.next_cell() {
+                        Ok(Some(Cell {
+                            val: DataRef::Empty,
+                            ..
+                        })) => (),
+                        Ok(Some(cell)) => {
+                            if cell.pos.0 >= header_row_idx {
+                                cells.push(cell);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // If `header_row` is set and the first non-empty cell is not at the `header_row`, we add
+                // an empty cell at the beginning with row `header_row` and same column as the first non-empty cell.
+                if cells.first().map_or(false, |c| c.pos.0 != header_row_idx) {
+                    cells.insert(
+                        0,
+                        Cell {
+                            pos: (
+                                header_row_idx,
+                                cells.first().expect("cells should not be empty").pos.1,
+                            ),
+                            val: DataRef::Empty,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(Range::from_sparse(cells))
+    }
+}
+
 fn xml_reader<'a, RS: Read + Seek>(
     zip: &'a mut ZipArchive<RS>,
     path: &str,
-) -> Option<Result<XlReader<'a>, XlsxError>> {
+) -> Option<Result<XlReader<'a, RS>, XlsxError>> {
     let actual_path = zip
         .file_names()
         .find(|n| n.eq_ignore_ascii_case(path))?
@@ -975,10 +1103,11 @@ fn xml_reader<'a, RS: Read + Seek>(
     match zip.by_name(&actual_path) {
         Ok(f) => {
             let mut r = XmlReader::from_reader(BufReader::new(f));
-            r.check_end_names(false)
-                .trim_text(false)
-                .check_comments(false)
-                .expand_empty_elements(true);
+            let config = r.config_mut();
+            config.check_end_names = false;
+            config.trim_text(false);
+            config.check_comments = false;
+            config.expand_empty_elements = true;
             Some(Ok(r))
         }
         Err(ZipError::FileNotFound) => None,
@@ -1077,6 +1206,9 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
             }
             c @ b'A'..=b'Z' => {
                 if readrow {
+                    if row == 0 {
+                        return Err(XlsxError::RangeWithoutRowComponent);
+                    }
                     pow = 1;
                     readrow = false;
                 }
@@ -1085,6 +1217,9 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
             }
             c @ b'a'..=b'z' => {
                 if readrow {
+                    if row == 0 {
+                        return Err(XlsxError::RangeWithoutRowComponent);
+                    }
                     pow = 1;
                     readrow = false;
                 }
@@ -1101,10 +1236,13 @@ fn get_row_and_optional_column(range: &[u8]) -> Result<(u32, Option<u32>), XlsxE
 }
 
 /// attempts to read either a simple or richtext string
-pub(crate) fn read_string(
-    xml: &mut XlReader<'_>,
-    QName(closing): QName,
-) -> Result<Option<String>, XlsxError> {
+pub(crate) fn read_string<RS>(
+    xml: &mut XlReader<'_, RS>,
+    closing: QName,
+) -> Result<Option<String>, XlsxError>
+where
+    RS: Read + Seek,
+{
     let mut buf = Vec::with_capacity(1024);
     let mut val_buf = Vec::with_capacity(1024);
     let mut rich_buffer: Option<String> = None;
@@ -1121,7 +1259,7 @@ pub(crate) fn read_string(
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rPh" => {
                 is_phonetic_text = true;
             }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == closing => {
+            Ok(Event::End(ref e)) if e.name() == closing => {
                 return Ok(rich_buffer);
             }
             Ok(Event::End(ref e)) if e.local_name().as_ref() == b"rPh" => {
@@ -1142,7 +1280,7 @@ pub(crate) fn read_string(
                     s.push_str(&value);
                 } else {
                     // consume any remaining events up to expected closing tag
-                    xml.read_to_end_into(QName(closing), &mut val_buf)?;
+                    xml.read_to_end_into(closing, &mut val_buf)?;
                     return Ok(Some(value));
                 }
             }
@@ -1166,7 +1304,10 @@ fn check_for_password_protected<RS: Read + Seek>(reader: &mut RS) -> Result<(), 
     Ok(())
 }
 
-fn read_merge_cells(xml: &mut XlReader<'_>) -> Result<Vec<Dimensions>, XlsxError> {
+fn read_merge_cells<RS>(xml: &mut XlReader<'_, RS>) -> Result<Vec<Dimensions>, XlsxError>
+where
+    RS: Read + Seek,
+{
     let mut merge_cells = Vec::new();
 
     loop {
@@ -1197,48 +1338,9 @@ fn read_merge_cells(xml: &mut XlReader<'_>) -> Result<Vec<Dimensions>, XlsxError
     Ok(merge_cells)
 }
 
-/// check if a char vector is a valid cell name  
-/// column name must be between A and XFD,
-/// last char must be digit
-fn valid_cell_name(name: &[char]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    if name.len() < 2 {
-        return false;
-    }
-    if name.len() > 3 {
-        if name[3].is_ascii_alphabetic() {
-            return false;
-        }
-        if name[2].is_alphabetic() {
-            if "YZ".contains(name[0]) {
-                return false;
-            } else if name[0] == 'X' {
-                if name[1] == 'F' {
-                    if !"ABCD".contains(name[2]) {
-                        return false;
-                    };
-                } else if !"ABCDE".contains(name[1]) {
-                    return false;
-                }
-            }
-        }
-    }
-    match name.last() {
-        Some(c) => c.is_ascii_digit(),
-        _ => false,
-    }
-}
-
 /// advance the cell name by the offset
-fn replace_cell(name: &[char], offset: (i64, i64)) -> Result<Vec<u8>, XlsxError> {
-    let cell = get_row_column(
-        name.into_iter()
-            .map(|c| *c as u8)
-            .collect::<Vec<_>>()
-            .as_slice(),
-    )?;
+fn offset_cell_name(name: &[char], offset: (i64, i64)) -> Result<Vec<u8>, XlsxError> {
+    let cell = get_row_column(name.iter().map(|c| *c as u8).collect::<Vec<_>>().as_slice())?;
     coordinate_to_name((
         (cell.0 as i64 + offset.0) as u32,
         (cell.1 as i64 + offset.1) as u32,
@@ -1271,8 +1373,8 @@ fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> 
             is_cell_row = true;
             cell.push(c);
         } else {
-            if valid_cell_name(cell.as_ref()) {
-                res.extend(replace_cell(cell.as_ref(), offset)?);
+            if let Ok(cell_name) = offset_cell_name(cell.as_ref(), offset) {
+                res.extend(cell_name);
             } else {
                 res.extend(cell.iter().map(|c| *c as u8));
             }
@@ -1282,8 +1384,8 @@ fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> 
         }
     }
     if !cell.is_empty() {
-        if valid_cell_name(cell.as_ref()) {
-            res.extend(replace_cell(cell.as_ref(), offset)?);
+        if let Ok(cell_name) = offset_cell_name(cell.as_ref(), offset) {
+            res.extend(cell_name);
         } else {
             res.extend(cell.iter().map(|c| *c as u8));
         }
@@ -1294,7 +1396,7 @@ fn replace_cell_names(s: &str, offset: (i64, i64)) -> Result<String, XlsxError> 
     }
 }
 
-/// Convert the integer to Excelsheet column title.  
+/// Convert the integer to Excelsheet column title.
 /// If the column number not in 1~16384, an Error is returned.
 pub(crate) fn column_number_to_name(num: u32) -> Result<Vec<u8>, XlsxError> {
     if num >= MAX_COLUMNS {
@@ -1311,7 +1413,7 @@ pub(crate) fn column_number_to_name(num: u32) -> Result<Vec<u8>, XlsxError> {
     Ok(col)
 }
 
-/// Convert a cell coordinate to Excelsheet cell name.  
+/// Convert a cell coordinate to Excelsheet cell name.
 /// If the column number not in 1~16384, an Error is returned.
 pub(crate) fn coordinate_to_name(cell: (u32, u32)) -> Result<Vec<u8>, XlsxError> {
     let cell = &[
@@ -1324,6 +1426,9 @@ pub(crate) fn coordinate_to_name(cell: (u32, u32)) -> Result<Vec<u8>, XlsxError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
     #[test]
     fn test_dimensions() {
@@ -1416,5 +1521,60 @@ mod tests {
             .unwrap(),
             "A2 is a cell, B2 is another, also C108, but XFE123 is not and \"A3\" in quote wont change.".to_owned()
         );
+    }
+
+    #[test]
+    fn test_read_shared_strings_with_namespaced_si_name() {
+        let shared_strings_data = br#"<?xml version="1.0" encoding="utf-8"?>
+<x:sst count="1187" uniqueCount="1187" xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+    <x:si>
+        <x:t>String 1</x:t>
+    </x:si>
+    <x:si>
+        <x:r>
+            <x:rPr>
+                <x:sz val="11"/>
+            </x:rPr>
+            <x:t>String 2</x:t>
+        </x:r>
+    </x:si>
+    <x:si>
+        <x:r>
+            <x:t>String 3</x:t>
+        </x:r>
+    </x:si>
+</x:sst>"#;
+
+        let mut buf = [0; 1000];
+        let mut zip_writer = ZipWriter::new(std::io::Cursor::new(&mut buf[..]));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip_writer
+            .start_file("xl/sharedStrings.xml", options)
+            .unwrap();
+        zip_writer.write(shared_strings_data).unwrap();
+        let zip_size = zip_writer.finish().unwrap().position() as usize;
+
+        let zip = ZipArchive::new(std::io::Cursor::new(&buf[..zip_size])).unwrap();
+
+        let mut xlsx = Xlsx {
+            zip,
+            strings: vec![],
+            sheets: vec![],
+            tables: None,
+            formats: vec![],
+            is_1904: false,
+            metadata: Metadata::default(),
+            #[cfg(feature = "picture")]
+            pictures: None,
+            merged_regions: None,
+            options: XlsxOptions::default(),
+        };
+
+        assert!(xlsx.read_shared_strings().is_ok());
+        assert_eq!(3, xlsx.strings.len());
+        assert_eq!("String 1", &xlsx.strings[0]);
+        assert_eq!("String 2", &xlsx.strings[1]);
+        assert_eq!("String 3", &xlsx.strings[2]);
     }
 }

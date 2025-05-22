@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use serde::de::Visitor;
-use serde::{self, Deserialize};
+use serde::Deserialize;
 
 use super::CellErrorType;
 
@@ -154,7 +154,7 @@ impl DataType for Data {
             Data::Int(v) => Some(*v),
             Data::Float(v) => Some(*v as i64),
             Data::Bool(v) => Some(*v as i64),
-            Data::String(v) => v.parse::<i64>().ok(),
+            Data::String(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
             _ => None,
         }
     }
@@ -164,7 +164,7 @@ impl DataType for Data {
             Data::Int(v) => Some(*v as f64),
             Data::Float(v) => Some(*v),
             Data::Bool(v) => Some((*v as i32).into()),
-            Data::String(v) => v.parse::<f64>().ok(),
+            Data::String(v) => fast_float2::parse(v).ok(),
             _ => None,
         }
     }
@@ -172,10 +172,7 @@ impl DataType for Data {
 
 impl PartialEq<&str> for Data {
     fn eq(&self, other: &&str) -> bool {
-        match *self {
-            Data::String(ref s) if s == other => true,
-            _ => false,
-        }
+        matches!(*self, Data::String(ref s) if s == other)
     }
 }
 
@@ -475,8 +472,8 @@ impl DataType for DataRef<'_> {
             DataRef::Int(v) => Some(*v),
             DataRef::Float(v) => Some(*v as i64),
             DataRef::Bool(v) => Some(*v as i64),
-            DataRef::String(v) => v.parse::<i64>().ok(),
-            DataRef::SharedString(v) => v.parse::<i64>().ok(),
+            DataRef::String(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
+            DataRef::SharedString(v) => atoi_simd::parse::<i64>(v.as_bytes()).ok(),
             _ => None,
         }
     }
@@ -486,10 +483,40 @@ impl DataType for DataRef<'_> {
             DataRef::Int(v) => Some(*v as f64),
             DataRef::Float(v) => Some(*v),
             DataRef::Bool(v) => Some((*v as i32).into()),
-            DataRef::String(v) => v.parse::<f64>().ok(),
-            DataRef::SharedString(v) => v.parse::<f64>().ok(),
+            DataRef::String(v) => fast_float2::parse(v).ok(),
+            DataRef::SharedString(v) => fast_float2::parse(v).ok(),
             _ => None,
         }
+    }
+}
+
+impl PartialEq<&str> for DataRef<'_> {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(*self, DataRef::String(ref s) if s == other)
+    }
+}
+
+impl PartialEq<str> for DataRef<'_> {
+    fn eq(&self, other: &str) -> bool {
+        matches!(*self, DataRef::String(ref s) if s == other)
+    }
+}
+
+impl PartialEq<f64> for DataRef<'_> {
+    fn eq(&self, other: &f64) -> bool {
+        matches!(*self, DataRef::Float(ref s) if *s == *other)
+    }
+}
+
+impl PartialEq<bool> for DataRef<'_> {
+    fn eq(&self, other: &bool) -> bool {
+        matches!(*self, DataRef::Bool(ref s) if *s == *other)
+    }
+}
+
+impl PartialEq<i64> for DataRef<'_> {
+    fn eq(&self, other: &i64) -> bool {
+        matches!(*self, DataRef::Int(ref s) if *s == *other)
     }
 }
 
@@ -569,8 +596,7 @@ pub trait DataType {
         if self.is_datetime_iso() {
             self.as_datetime().map(|dt| dt.date()).or_else(|| {
                 self.get_datetime_iso()
-                    .map(|s| chrono::NaiveDate::from_str(&s).ok())
-                    .flatten()
+                    .and_then(|s| chrono::NaiveDate::from_str(s).ok())
             })
         } else {
             self.as_datetime().map(|dt| dt.date())
@@ -584,13 +610,11 @@ pub trait DataType {
         if self.is_datetime_iso() {
             self.as_datetime().map(|dt| dt.time()).or_else(|| {
                 self.get_datetime_iso()
-                    .map(|s| chrono::NaiveTime::from_str(&s).ok())
-                    .flatten()
+                    .and_then(|s| chrono::NaiveTime::from_str(s).ok())
             })
         } else if self.is_duration_iso() {
             self.get_duration_iso()
-                .map(|s| chrono::NaiveTime::parse_from_str(&s, "PT%HH%MM%S%.fS").ok())
-                .flatten()
+                .and_then(|s| chrono::NaiveTime::parse_from_str(s, "PT%HH%MM%S%.fS").ok())
         } else {
             self.as_datetime().map(|dt| dt.time())
         }
@@ -602,7 +626,7 @@ pub trait DataType {
         use chrono::Timelike;
 
         if self.is_datetime() {
-            self.get_datetime().map(|dt| dt.as_duration()).flatten()
+            self.get_datetime().and_then(|dt| dt.as_duration())
         } else if self.is_duration_iso() {
             // need replace in the future to smth like chrono::Duration::from_str()
             // https://github.com/chronotope/chrono/issues/579
@@ -628,7 +652,7 @@ pub trait DataType {
             self.get_datetime().map(|d| d.as_datetime())
         } else if self.is_datetime_iso() {
             self.get_datetime_iso()
-                .map(|s| chrono::NaiveDateTime::from_str(&s).ok())
+                .map(|s| chrono::NaiveDateTime::from_str(s).ok())
         } else {
             None
         }
